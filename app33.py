@@ -56,7 +56,6 @@ def fetch_data(target_date=None):
             start_date = (dt - timedelta(days=5)).strftime('%Y-%m-%d')
             end_date = (dt + timedelta(days=5)).strftime('%Y-%m-%d')
             
-            # ⭐ PLT 컬럼 포함해서 로드
             plan_res = supabase.table("production_plan_2026_01")\
                 .select("*")\
                 .gte("plan_date", start_date)\
@@ -130,10 +129,20 @@ def analyze_plan_issues(df):
     df['detected_issues'] = json.dumps(issues, ensure_ascii=False) if issues else '[]'
     return df
 
-# --- RAG: 유사 사례 검색 ---
+# --- RAG: 유사 사례 검색 (카테고리 분석 추가) ---
 def retrieve_similar_cases(history_df, current_issues):
     if history_df.empty or not current_issues:
         return "유사 사례 없음"
+    
+    # ⭐ 카테고리 코드 매핑
+    CATEGORY_MAP = {
+        'MDL1': '미달(생산순위 조정/모델교체) - 우선순위나 셋업 문제로 인한 미달',
+        'MDL2': '미달(라인전체이슈/설비) - 설비 고장 등 라인 전체적인 문제',
+        'MDL3': '미달(부품수급/자재결품) - 부품이 없어서 못 만든 경우',
+        'PRP': '과잉/선행 생산(숙제 미리하기) - 계획보다 더 많이 만든 경우',
+        'SMP': '계획외 긴급 생산 - 갑자기 들어온 긴급 오더',
+        'CCL': '계획 취소/라인 가동중단 - 생산 중단 또는 취소 상황'
+    }
     
     issue_types = set()
     for issue in current_issues:
@@ -145,6 +154,29 @@ def retrieve_similar_cases(history_df, current_issues):
             issue_types.add('품목')
     
     similar_cases = []
+    
+    # ⭐ 카테고리별 과거 패턴 분석
+    category_analysis = "\n\n## 📊 과거 9가지 카테고리 패턴 분석 (8~11월)\n"
+    for code, description in CATEGORY_MAP.items():
+        matched = history_df[history_df['최종_이슈분류'].str.contains(code, na=False, case=False)]
+        if not matched.empty:
+            avg_achievement = matched['누적달성률'].mean() if '누적달성률' in matched.columns else 0
+            count = len(matched)
+            category_analysis += f"\n### {code}: {description}\n"
+            category_analysis += f"- 발생 횟수: {count}회\n"
+            category_analysis += f"- 평균 달성률: {avg_achievement:.1f}%\n"
+            
+            if avg_achievement < 85:
+                category_analysis += f"- ⚠️ **주의**: 이 카테고리 발생 시 달성률 저하 경향 ({avg_achievement:.1f}%)\n"
+            
+            top_cases = matched.nlargest(2, '누적달성률') if '누적달성률' in matched.columns else matched.head(2)
+            category_analysis += "- 주요 사례:\n"
+            for idx, row in top_cases.iterrows():
+                category_analysis += f"  * {row.get('날짜', 'N/A')}, {row.get('품목명', 'N/A')}, {row.get('라인', 'N/A')}, 달성률 {row.get('누적달성률', 'N/A')}%\n"
+    
+    similar_cases.append(category_analysis)
+    
+    # 기존 이슈 타입별 검색
     for issue_type in issue_types:
         matched = history_df[history_df['최종_이슈분류'].str.contains(issue_type, na=False, case=False)]
         if not matched.empty:
@@ -240,10 +272,10 @@ def validate_ai_response(response, current_df):
     
     return is_valid, warnings, validation_report
 
-# --- AI 분석 엔진 (PLT 포함) ---
+# --- AI 분석 엔진 (카테고리 분석 추가) ---
 def ask_professional_scheduler(question, current_df, history_df):
     api_url = "https://ai.potens.ai/api/chat"
-    api_key = "qD2gfuVAkMJexDAcFb5GnEb1SZksTs7o"
+    api_key = "OsXduYGHTpWsK6X1slgtCh9eTJao23ni"
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
 
     if not current_df.empty:
@@ -253,7 +285,6 @@ def ask_professional_scheduler(question, current_df, history_df):
         }).reset_index()
         summary.columns = ['plan_date', 'line', 'total_qty', 'product_count']
         
-        # ⭐ PLT 정보 포함
         product_details = current_df.groupby(['plan_date', 'line']).apply(
             lambda x: x[['product_name', 'qty_0차', 'plt']].to_dict('records')
         ).reset_index()
@@ -261,7 +292,6 @@ def ask_professional_scheduler(question, current_df, history_df):
         
         summary = summary.merge(product_details, on=['plan_date', 'line'])
         
-        # ⭐ 품목별 PLT 정보 생성
         product_plt_map = {}
         for _, row in current_df.iterrows():
             product_name = row.get('product_name', '')
@@ -333,10 +363,38 @@ def ask_professional_scheduler(question, current_df, history_df):
     
     similar_cases = retrieve_similar_cases(history_df, detected_issues)
     
+    # ⭐ 카테고리 기반 시스템 프롬프트
     system_rules = f"""
-당신은 자동차 부품 조립라인의 '수석 생산 스케줄러'입니다.
+당신은 자동차 부품 조립라인의 '수석 생산 스케줄러'이며, **과거 9가지 이슈 카테고리 패턴을 마스터**했습니다.
 
-## ⚠️ 절대 규칙
+## 🎯 카테고리 기반 분석 규칙
+아래 제공된 [과거 9가지 카테고리 패턴 분석]을 반드시 참고하여 대안을 제시하세요:
+
+1. **MDL1 (모델교체/우선순위)** 패턴 발견 시:
+   - 품목 수를 줄이는 방향으로 제안
+   - 셋업 시간을 고려한 일정 조정
+
+2. **MDL2 (설비/라인 이슈)** 패턴 발견 시:
+   - 해당 라인 부하 분산을 우선 고려
+   - 다른 라인으로 사전 이동 권장
+
+3. **MDL3 (자재결품)** 패턴 발견 시:
+   - 과거 달성률 저하 경향이 있다면 명시
+   - 안전 재고 확보 방안 언급
+
+4. **PRP (선행생산)** 패턴 발견 시:
+   - 여유 CAPA 활용 가능 날짜 제안
+   - 과거 성공 사례의 선행 생산 기간 참고
+
+5. **SMP (긴급생산)** 패턴 발견 시:
+   - 즉시 대응 가능한 0 수량 셀 활용
+   - 다른 품목 연기 최소화
+
+6. **CCL (계획취소)** 패턴 발견 시:
+   - 대체 생산 계획 제안
+   - 라인 가동률 유지 방안
+
+## ⚠️ 절대 규칙 (기존 유지)
 1. **아래 [현재 1월 계획 데이터]에 명시된 "총 계획 수량"을 그대로 사용하세요**
 2. 숫자를 절대 임의로 계산하거나 추정하지 마세요
 3. 제공된 숫자를 그대로 인용하세요
@@ -344,10 +402,6 @@ def ask_professional_scheduler(question, current_df, history_df):
 5. **목적지 라인에 없는 품목으로는 절대 이동 제안 금지**
 6. **라인 간 이동 시 반드시 4일 후 날짜로 배치하세요**
 7. **모든 이동 수량은 해당 품목의 PLT 배수여야 합니다 (필수!)**
-8. ⭐ **조립2 요일 규칙은 절대 우선순위 - 최후의 수단으로만 위반 가능**
-   - 대안 1, 2에서는 **반드시 요일 규칙을 준수**하는 방법만 제안
-   - 대안 3(긴급안)에서만 예외적으로 요일 규칙 위반 허용
-   - 요일 규칙 위반 시 단점에 **"⚠️ 조립2 요일제 위반 (최후의 수단)"** 명시 필수
 
 ## 📊 현재 1월 계획 데이터 (정확한 집계)
 {data_text}
@@ -357,7 +411,7 @@ def ask_professional_scheduler(question, current_df, history_df):
 ## 🚨 사전 탐지 이슈
 {json.dumps(detected_issues, ensure_ascii=False, indent=2)}
 
-## 📚 유사 과거 사례
+## 📚 유사 과거 사례 (9가지 카테고리 포함)
 {similar_cases}
 
 {FEW_SHOT_EXAMPLES}
@@ -387,8 +441,11 @@ def ask_professional_scheduler(question, current_df, history_df):
 - PLT 배수 확인: [이동량] ÷ [PLT] = [정수]
 - 날짜 계산: [출발날짜] + 4일 = [도착날짜]
 - 현재 수량: [위 데이터 직접 인용]
+- **과거 카테고리 참고**: [해당하는 카테고리 코드와 평균 달성률 언급]
 
 **✅ 장점 / ⚠️ 단점**
+- 장점: [구체적]
+- 단점: [과거 카테고리 패턴상 예상되는 리스크 포함]
 
 ---
 (대안 2, 3 동일)
@@ -399,6 +456,7 @@ def ask_professional_scheduler(question, current_df, history_df):
 3. 이동 제안 전 반드시 목적지 라인에 해당 품목이 있는지 확인
 4. 라인 간 이동 시 반드시 +4일 계산
 5. **이동 수량은 반드시 해당 품목의 PLT 배수로 제안**
+6. **과거 카테고리 패턴을 근거에 반드시 포함**
 """
 
     payload = {
@@ -445,6 +503,7 @@ with st.sidebar:
     st.json(WEEKDAY_RULES)
     st.info("📌 라인 간 이동 시 +4일 후 배치")
     st.warning("📦 이동 수량은 PLT 배수 필수")
+    st.success("📊 과거 9가지 카테고리 패턴 반영")
     if st.button("🔄 데이터 동기화"):
         st.cache_data.clear()
         st.rerun()
@@ -467,7 +526,7 @@ if prompt := st.chat_input("이슈를 입력하세요 (예: 1/5 조립1 CAPA 초
     target_date = extract_date(prompt)
     st.session_state.target_date = target_date
     
-    with st.spinner("🚀 분석 중..."):
+    with st.spinner("🚀 분석 중 (과거 카테고리 패턴 참조)..."):
         history_df, current_plan = fetch_data(target_date)
         answer, is_valid, warnings, validation_report = ask_professional_scheduler(prompt, current_plan, history_df)
         
@@ -516,5 +575,3 @@ with st.expander("🐛 디버그: 사전 탐지 이슈 및 품목 이동 매트�
                     st.write(f"  - {prod} (PLT: {plt_val})")
     else:
         st.info("💡 날짜가 포함된 질문을 입력하면 디버그 정보가 표시됩니다.")
-
-
